@@ -1,0 +1,422 @@
+# Manually triggered build of an unsigned RustDesk IPA for real arm64 iPhones,
+# meant to be signed afterwards by the user (e.g. with Sideloadly).
+# The build steps mirror the `build-rustdesk-ios` job in flutter-build.yml and
+# reuse bridge.yml for the flutter_rust_bridge files.
+name: Build unsigned iOS IPA
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  RUST_VERSION: "1.75" # keep in sync with flutter-build.yml
+  FLUTTER_VERSION: "3.24.5" # keep in sync with flutter-build.yml
+  VCPKG_BINARY_SOURCES: "clear;x-gha,readwrite"
+  VCPKG_COMMIT_ID: "9e593bb18ea69cc5095e012465dcd675a822ed0d" # keep in sync with flutter-build.yml
+  # PR #16660: keep background music playing during remote sessions.
+  IOS_AUDIO_FIX_COMMIT: "398364fa187d0559c39462366a61dd0b25652e78"
+  OFFICIAL_REPO: "https://github.com/rustdesk/rustdesk.git"
+
+jobs:
+  generate-bridge:
+    uses: ./.github/workflows/bridge.yml
+
+  build-ios-ipa:
+    name: Build unsigned iOS IPA (arm64 device)
+    needs: [generate-bridge]
+    runs-on: macos-15
+    env:
+      TARGET: aarch64-apple-ios
+      VCPKG_TRIPLET: arm64-ios
+    outputs:
+      artifact-name: ${{ steps.package.outputs.artifact-name }}
+      ipa-name: ${{ steps.package.outputs.ipa-name }}
+    steps:
+      - name: Export GitHub Actions cache environment variables
+        uses: actions/github-script@d7906e4ad0b1822421a7e6a35d5ca353c962f410 # v6
+        with:
+          script: |
+            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
+            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+
+      - name: Install dependencies
+        run: |
+          brew install nasm yasm
+
+      - name: Checkout source code
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          submodules: recursive
+          fetch-depth: 300
+          persist-credentials: false
+
+      - name: Check source version and provenance
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION=$(awk -F'"' '/^version = "/{print $2; exit}' Cargo.toml)
+          PUBSPEC_VERSION=$(awk '/^version:/{print $2; exit}' flutter/pubspec.yaml)
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          echo "Cargo version: $VERSION, pubspec version: $PUBSPEC_VERSION"
+          IFS=. read -r V_MAJOR V_MINOR V_PATCH <<< "$VERSION"
+          V_PATCH=${V_PATCH%%[!0-9]*}
+          if (( V_MAJOR * 1000000 + V_MINOR * 1000 + ${V_PATCH:-0} < 1005001 )); then
+            echo "::error::RustDesk $VERSION is older than 1.5.1"
+            exit 1
+          fi
+          if ! grep -q 'setCategory(.ambient)' flutter/ios/Runner/AppDelegate.swift; then
+            echo "::error::The iOS background-music fix (#16660) is missing from flutter/ios/Runner/AppDelegate.swift"
+            exit 1
+          fi
+          if git merge-base --is-ancestor "$IOS_AUDIO_FIX_COMMIT" HEAD 2>/dev/null; then
+            FIX_STATUS="commit ${IOS_AUDIO_FIX_COMMIT:0:10} is an ancestor of HEAD"
+          else
+            FIX_STATUS="code present (commit outside the fetched history)"
+          fi
+
+          BASE="unknown"
+          CHANGED=""
+          OFFICIAL_MASTER="unavailable"
+          if git fetch --no-tags --depth=300 "$OFFICIAL_REPO" master; then
+            OFFICIAL_MASTER=$(git rev-parse FETCH_HEAD)
+            if BASE=$(git merge-base HEAD FETCH_HEAD); then
+              CHANGED=$(git diff --name-only "$BASE" HEAD -- . ':(exclude).github/workflows/ios-unsigned-ipa.yml')
+            else
+              BASE="unknown (not found in the last 300 commits)"
+            fi
+          fi
+          {
+            echo "## Source"
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Repository | \`${GITHUB_REPOSITORY}\` |"
+            echo "| Built commit | \`${GITHUB_SHA}\` |"
+            echo "| Ref | \`${GITHUB_REF_NAME}\` |"
+            echo "| RustDesk version (Cargo.toml) | \`${VERSION}\` |"
+            echo "| Flutter app version (pubspec) | \`${PUBSPEC_VERSION}\` |"
+            echo "| #16660 background-music fix | ${FIX_STATUS} |"
+            echo "| Official rustdesk/rustdesk master | \`${OFFICIAL_MASTER}\` |"
+            echo "| Official base commit (merge-base) | \`${BASE}\` |"
+            echo ""
+            if [ -n "$CHANGED" ]; then
+              echo "Files differing from the official base commit (excluding this workflow):"
+              echo '```'
+              echo "$CHANGED"
+              echo '```'
+            else
+              echo "No source differences from the official base commit apart from this workflow file."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Install flutter
+        uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2
+        with:
+          channel: "stable"
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+
+      - name: Patch flutter
+        run: |
+          cd $(dirname $(dirname $(which flutter)))
+          if [[ "3.24.5" == ${{env.FLUTTER_VERSION}} ]]; then
+            git apply ${{ github.workspace }}/.github/patches/flutter_3.24.4_dropdown_menu_enableFilter.diff
+          fi
+
+      - name: Setup vcpkg with Github Actions binary cache
+        uses: lukka/run-vcpkg@b1a0dd252f06b9e25b3c022a9a03bd7a427fb6a2 # v11
+        with:
+          vcpkgGitCommitId: ${{ env.VCPKG_COMMIT_ID }}
+          doNotCache: false
+
+      - name: Install vcpkg dependencies
+        run: |
+          if ! $VCPKG_ROOT/vcpkg \
+            install \
+            --triplet ${{ env.VCPKG_TRIPLET }} \
+            --x-install-root="$VCPKG_ROOT/installed"; then
+            find "${VCPKG_ROOT}/" -name "*.log" | while read -r _1; do
+              echo "$_1:"
+              echo "======"
+              cat "$_1"
+              echo "======"
+              echo ""
+            done
+            exit 1
+          fi
+          head -n 100 "${VCPKG_ROOT}/buildtrees/ffmpeg/build-${{ env.VCPKG_TRIPLET }}-rel-out.log" || true
+        shell: bash
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          targets: ${{ env.TARGET }}
+          components: "rustfmt"
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          prefix-key: rustdesk-lib-cache-ios
+          key: ${{ env.TARGET }}
+
+      - name: Restore bridge files
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: bridge-artifact
+          path: ./
+
+      - name: Build rustdesk lib
+        run: |
+          rustup target add ${{ env.TARGET }}
+          cargo build --locked --features flutter,hwcodec --release --target ${{ env.TARGET }} --lib
+
+      - name: Verify ARM64 native libraries in liblibrustdesk.a
+        shell: bash
+        run: |
+          set -euo pipefail
+          export LC_ALL=C
+          LIB="target/$TARGET/release/liblibrustdesk.a"
+          VCPKG_LIB_DIR="$VCPKG_ROOT/installed/$VCPKG_TRIPLET/lib"
+          WORK="$RUNNER_TEMP/native-check"
+          mkdir -p "$WORK"
+          fail=0
+
+          test -s "$LIB"
+          ARCHS=$(lipo -archs "$LIB")
+          echo "$LIB: archs=$ARCHS size=$(du -h "$LIB" | cut -f1)"
+          if [ "$ARCHS" != "arm64" ]; then
+            echo "::error::$LIB must contain only arm64, got: $ARCHS"
+            fail=1
+          fi
+          # Mach-O platform 2 is iOS (device); 7 would be the iOS Simulator.
+          otool -l "$LIB" | awk '/cmd LC_BUILD_VERSION/{f=1;next} f&&$1=="platform"{print $2;f=0}' \
+            | sort | uniq -c > "$WORK/platforms.txt"
+          echo "LC_BUILD_VERSION platforms in $LIB (count platform):"
+          cat "$WORK/platforms.txt"
+          if awk '$2!="2" && $2!="IOS"{bad=1} END{exit !bad}' "$WORK/platforms.txt"; then
+            echo "::error::$LIB contains objects that are not built for iOS devices"
+            fail=1
+          fi
+
+          nm -gU -j "$LIB" 2>/dev/null | grep -v -e ':$' -e '^$' | sort -u > "$WORK/rustdesk-syms.txt"
+          cat target/$TARGET/release/build/*/output 2>/dev/null \
+            | sed -n 's/^cargo:rustc-link-lib=static=//p' | sort -u > "$WORK/static-libs.txt"
+          echo "Static native libraries requested by build scripts:"
+          cat "$WORK/static-libs.txt"
+
+          {
+            echo "## Native ARM64 libraries bundled into liblibrustdesk.a"
+            echo ""
+            echo "| Library | Source | Archs | Bundled |"
+            echo "|---|---|---|---|"
+          } >> "$GITHUB_STEP_SUMMARY"
+          for name in vpx aom yuv opus; do
+            grep -qx "$name" "$WORK/static-libs.txt" || {
+              echo "::error::Expected static library '$name' was not linked by any build script"
+              fail=1
+            }
+          done
+          while read -r name; do
+            a="$VCPKG_LIB_DIR/lib$name.a"
+            if [ ! -f "$a" ]; then
+              echo "| $name | crate build | - | - |" >> "$GITHUB_STEP_SUMMARY"
+              continue
+            fi
+            larchs=$(lipo -archs "$a")
+            nm -gU -j "$a" 2>/dev/null | grep -v -e ':$' -e '^$' | sort -u > "$WORK/lib-$name.txt"
+            total=$(wc -l < "$WORK/lib-$name.txt" | tr -d ' ')
+            missing=$(comm -23 "$WORK/lib-$name.txt" "$WORK/rustdesk-syms.txt" | wc -l | tr -d ' ')
+            echo "lib$name.a: archs=$larchs exported=$total missing-from-liblibrustdesk.a=$missing"
+            status="yes ($total symbols)"
+            if [ "$larchs" != "arm64" ]; then
+              echo "::error::$a is not arm64-only: $larchs"
+              fail=1
+              status="wrong arch"
+            fi
+            if [ "$total" -eq 0 ] || [ "$missing" -ne 0 ]; then
+              echo "::error::lib$name.a is not fully bundled into $LIB ($missing of $total symbols missing)"
+              fail=1
+              status="no ($missing/$total missing)"
+            fi
+            echo "| lib$name.a | vcpkg $VCPKG_TRIPLET | $larchs | $status |" >> "$GITHUB_STEP_SUMMARY"
+          done < "$WORK/static-libs.txt"
+          exit $fail
+
+      - name: Build rustdesk
+        shell: bash
+        run: |
+          pushd flutter
+          flutter build ipa --release --no-codesign
+
+      - name: Package unsigned IPA
+        id: package
+        shell: bash
+        run: |
+          set -euo pipefail
+          IPA_NAME="rustdesk-${VERSION}-ios-arm64-unsigned.ipa"
+          OUT="$RUNNER_TEMP/ipa"
+          rm -rf "$OUT" && mkdir -p "$OUT/Payload"
+          FLUTTER_IPA=$(find flutter/build/ios/ipa -maxdepth 1 -name '*.ipa' 2>/dev/null | head -n 1 || true)
+          if [ -n "$FLUTTER_IPA" ]; then
+            echo "flutter build ipa produced $FLUTTER_IPA"
+            cp "$FLUTTER_IPA" "$OUT/$IPA_NAME"
+            (cd "$OUT" && unzip -q "$IPA_NAME" 'Payload/*')
+          else
+            APP=flutter/build/ios/archive/Runner.xcarchive/Products/Applications/Runner.app
+            if [ ! -d "$APP" ]; then
+              echo "::error::Neither an IPA nor $APP was produced"
+              exit 1
+            fi
+            echo "No IPA from flutter build ipa (code signing disabled); packaging $APP"
+            ditto "$APP" "$OUT/Payload/Runner.app"
+            (cd "$OUT" && zip -qry "$IPA_NAME" Payload)
+          fi
+          echo "IPA_PATH=$OUT/$IPA_NAME" >> "$GITHUB_ENV"
+          echo "APP_PATH=$OUT/Payload/Runner.app" >> "$GITHUB_ENV"
+          echo "ipa-name=$IPA_NAME" >> "$GITHUB_OUTPUT"
+          echo "artifact-name=${IPA_NAME%.ipa}" >> "$GITHUB_OUTPUT"
+
+      - name: Verify IPA contents
+        shell: bash
+        run: |
+          set -euo pipefail
+          export LC_ALL=C
+          fail=0
+          unzip -l "$IPA_PATH" > "$RUNNER_TEMP/ipa-list.txt"
+          head -n 40 "$RUNNER_TEMP/ipa-list.txt"
+          awk '{print $4}' "$RUNNER_TEMP/ipa-list.txt" > "$RUNNER_TEMP/ipa-entries.txt"
+          for entry in Payload/Runner.app/Runner Payload/Runner.app/Info.plist \
+                       Payload/Runner.app/Frameworks/Flutter.framework/Flutter \
+                       Payload/Runner.app/Frameworks/App.framework/App; do
+            if ! grep -qx "$entry" "$RUNNER_TEMP/ipa-entries.txt"; then
+              echo "::error::$entry missing from IPA"
+              fail=1
+            fi
+          done
+          if grep -q '^Payload/Runner.app/_CodeSignature/' "$RUNNER_TEMP/ipa-entries.txt"; then
+            echo "::warning::Runner.app carries a code signature; it will be replaced when re-signed"
+          fi
+
+          PLIST="$APP_PATH/Info.plist"
+          BUNDLE_ID=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$PLIST")
+          SHORT_VERSION=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$PLIST")
+          BUILD_NUMBER=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$PLIST")
+          MIN_OS=$(/usr/libexec/PlistBuddy -c 'Print :MinimumOSVersion' "$PLIST" || echo unknown)
+          PLATFORMS=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleSupportedPlatforms:0' "$PLIST" || echo unknown)
+          echo "Bundle: $BUNDLE_ID $SHORT_VERSION ($BUILD_NUMBER), min iOS $MIN_OS, platforms $PLATFORMS"
+          if [ "$PLATFORMS" != "iPhoneOS" ]; then
+            echo "::error::CFBundleSupportedPlatforms is '$PLATFORMS', expected iPhoneOS (device build)"
+            fail=1
+          fi
+
+          {
+            echo "## Mach-O binaries in Runner.app"
+            echo ""
+            echo "| Binary | Archs | Platform |"
+            echo "|---|---|---|"
+          } >> "$GITHUB_STEP_SUMMARY"
+          while IFS= read -r -d '' f; do
+            [[ "$(file -b "$f")" == *Mach-O* ]] || continue
+            rel="${f#$APP_PATH/}"
+            archs=$(lipo -archs "$f")
+            otool -l "$f" > "$RUNNER_TEMP/loadcmds.txt"
+            plat=$(awk '/cmd LC_BUILD_VERSION/{f=1;next} f&&$1=="platform"{print $2;f=0}' "$RUNNER_TEMP/loadcmds.txt" | sort -u | tr '\n' ' ' | sed 's/ $//')
+            if [ -z "$plat" ] && grep 'LC_VERSION_MIN_IPHONEOS' "$RUNNER_TEMP/loadcmds.txt" > /dev/null; then
+              plat="2"
+            fi
+            echo "$rel: archs=$archs platform=${plat:-none}"
+            echo "| $rel | $archs | ${plat:-none} |" >> "$GITHUB_STEP_SUMMARY"
+            if [[ " $archs " != *" arm64 "* ]]; then
+              echo "::error::$rel has no arm64 slice"
+              fail=1
+            fi
+            if [ "$plat" != "2" ] && [ "$plat" != "IOS" ]; then
+              echo "::error::$rel is not built for iOS devices (platform ${plat:-none})"
+              fail=1
+            fi
+          done < <(find "$APP_PATH" -type f -print0)
+
+          # Dart looks up the Rust FFI entry points by name at runtime.
+          nm -gU -j "$APP_PATH/Runner" | sort -u > "$RUNNER_TEMP/runner-syms.txt"
+          grep -oE 'pub extern "C" fn [A-Za-z0-9_]+' src/bridge_generated.io.rs \
+            | awk '{print "_" $5}' | sort -u > "$RUNNER_TEMP/ffi-syms.txt"
+          FFI_TOTAL=$(wc -l < "$RUNNER_TEMP/ffi-syms.txt" | tr -d ' ')
+          FFI_MISSING=$(comm -23 "$RUNNER_TEMP/ffi-syms.txt" "$RUNNER_TEMP/runner-syms.txt")
+          echo "Rust FFI entry points exported by Runner: $FFI_TOTAL expected"
+          if [ "$FFI_TOTAL" -eq 0 ] || [ -n "$FFI_MISSING" ]; then
+            echo "::error::Rust FFI symbols missing from Runner: $(echo $FFI_MISSING | head -c 2000)"
+            fail=1
+          fi
+
+          SHA256=$(shasum -a 256 "$IPA_PATH" | cut -d' ' -f1)
+          SIZE=$(du -h "$IPA_PATH" | cut -f1)
+          {
+            echo ""
+            echo "## IPA"
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| File | \`$(basename "$IPA_PATH")\` ($SIZE) |"
+            echo "| SHA-256 | \`$SHA256\` |"
+            echo "| Bundle ID | \`$BUNDLE_ID\` |"
+            echo "| Version | \`$SHORT_VERSION\` (build \`$BUILD_NUMBER\`) |"
+            echo "| Minimum iOS | \`$MIN_OS\` |"
+            echo "| Rust FFI symbols linked | $FFI_TOTAL |"
+            echo "| Code signing | none (sign before installing) |"
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit $fail
+
+      - name: Upload unsigned IPA
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ steps.package.outputs.artifact-name }}
+          path: ${{ env.IPA_PATH }}
+          if-no-files-found: error
+          compression-level: 0
+
+  verify-artifact:
+    name: Verify uploaded IPA artifact
+    needs: [build-ios-ipa]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download IPA artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ${{ needs.build-ios-ipa.outputs.artifact-name }}
+          path: ipa
+
+      - name: Check Payload/Runner.app
+        shell: bash
+        env:
+          IPA_NAME: ${{ needs.build-ios-ipa.outputs.ipa-name }}
+        run: |
+          set -euo pipefail
+          IPA="ipa/$IPA_NAME"
+          ls -la ipa
+          test -f "$IPA"
+          unzip -l "$IPA" | awk '{print $4}' > entries.txt
+          fail=0
+          for entry in Payload/Runner.app/Runner Payload/Runner.app/Info.plist; do
+            if grep -qx "$entry" entries.txt; then
+              echo "found $entry"
+            else
+              echo "::error::$entry missing from the uploaded artifact"
+              fail=1
+            fi
+          done
+          grep '^Payload/' entries.txt | grep -vx 'Payload/' | grep -v '^Payload/Runner.app/' > extra.txt || true
+          if [ -s extra.txt ]; then
+            echo "::error::Payload contains something other than Runner.app:"
+            cat extra.txt
+            fail=1
+          fi
+          {
+            echo "## Uploaded artifact check"
+            echo ""
+            echo "- Artifact: \`${{ needs.build-ios-ipa.outputs.artifact-name }}\`"
+            echo "- IPA: \`$IPA_NAME\`, SHA-256 \`$(sha256sum "$IPA" | cut -d' ' -f1)\`"
+            echo "- Entries under Payload/Runner.app: $(grep -c '^Payload/Runner.app/' entries.txt)"
+            echo "- Contains Payload/Runner.app: $([ $fail -eq 0 ] && echo yes || echo NO)"
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit $fail
